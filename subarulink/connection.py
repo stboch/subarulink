@@ -23,14 +23,7 @@ _LOGGER = logging.getLogger(__name__)
 class Connection:
     """Connection to Subaru Starlink API."""
 
-    def __init__(
-        self,
-        websession: aiohttp.ClientSession,
-        username,
-        password,
-        device_id,
-        device_name,
-    ) -> None:
+    def __init__(self, websession: aiohttp.ClientSession, username, password, device_id, device_name,) -> None:
         """Initialize connection object."""
         self.username = username
         self.password = password
@@ -53,8 +46,9 @@ class Connection:
         self.websession = websession
         self.authenticated = False
         self.authorized = False
+        self.current_vin = None
 
-    async def connect(self) -> bool:
+    async def connect(self):
         """Connect to and establish session with Subaru Remote Services API."""
         if await self._authenticate():
             await self._refresh_vehicles()
@@ -65,39 +59,32 @@ class Connection:
         return None
 
     async def validate_session(self, vin):
-        """Validate if current session cookie is still valid with Subaru Remote Services API."""
+        """Validate if current session cookie is still valid with Subaru Remote Services API and vehicle context is correct."""
+        result = False
         resp = await self.__open("/validateSession.json", "get")
         js_resp = await resp.json()
         _LOGGER.debug(pprint.pformat(js_resp))
         if js_resp["success"]:
-            return True
-        if await self._authenticate(vin):
-            await self.select_vehicle(vin)
-            return True
-        self.authenticated = False
-        return False
-
-    async def select_vehicle(self, vin):
-        """Select active vehicle for accounts with multiple VINs."""
-        params = {}
-        params["vin"] = vin
-        params["_"] = int(time.time())
-        js_resp = await self.get("/selectVehicle.json", params=params)
-        _LOGGER.debug(pprint.pformat(js_resp))
-        if js_resp["success"]:
-            _LOGGER.debug("Current vehicle: vin=%s", js_resp["data"]["vin"])
-            return js_resp["data"]
+            if vin != self.current_vin:
+                # API call for VIN that is not the current remote context.
+                _LOGGER.debug("Switching Subaru API vehicle context to: %s", vin)
+                if await self._select_vehicle(vin):
+                    result = True
+            else:
+                result = True
+        elif await self._authenticate(vin):
+            # New session cookie.  Must call selectVehicle.json before any other API call.
+            if await self._select_vehicle(vin):
+                result = True
+        else:
+            self.authenticated = False
+        return result
 
     async def get(self, command, params=None, data=None, json=None):
         """Send HTTPS GET request to Subaru Remote Services API."""
         if self.authenticated:
             resp = await self.__open(
-                f"{command}",
-                method="get",
-                headers=self.head,
-                params=params,
-                data=data,
-                json=json,
+                f"{command}", method="get", headers=self.head, params=params, data=data, json=json,
             )
             js_resp = await resp.json()
             return js_resp
@@ -106,12 +93,7 @@ class Connection:
         """Send HTTPS POST request to Subaru Remote Services API."""
         if self.authenticated:
             resp = await self.__open(
-                f"{command}",
-                method="post",
-                headers=self.head,
-                params=params,
-                data=data,
-                json=json,
+                f"{command}", method="post", headers=self.head, params=params, data=data, json=json,
             )
             js_resp = await resp.json()
             return js_resp
@@ -129,30 +111,39 @@ class Connection:
                 "pushToken": None,
                 "deviceType": "android",
             }
-            resp = await self.__open(
-                "/login.json", "post", data=post_data, headers=self.head
-            )
+            resp = await self.__open("/login.json", "post", data=post_data, headers=self.head)
             resp = await resp.json()
             if resp["success"]:
                 _LOGGER.debug("Client authentication successful")
                 _LOGGER.debug(pprint.pformat(resp))
                 self.authenticated = True
                 self.authorized = resp["data"]["deviceRegistered"]
-                self.default_vin = resp["data"]["vehicles"][0]["vin"]
+                i = resp["data"]["currentVehicleIndex"]
+                self.current_vin = resp["data"]["vehicles"][i]["vin"]
                 return True
             if resp["errorCode"]:
                 _LOGGER.error("Client authentication failed")
                 raise SubaruException(resp["errorCode"])
             _LOGGER.error("Unknown failure")
             raise SubaruException(resp)
-        raise IncompleteCredentials(
-            "Connection requires email and password and device id."
-        )
+        raise IncompleteCredentials("Connection requires email and password and device id.")
+
+    async def _select_vehicle(self, vin):
+        """Select active vehicle for accounts with multiple VINs."""
+        params = {}
+        params["vin"] = vin
+        params["_"] = int(time.time())
+        js_resp = await self.get("/selectVehicle.json", params=params)
+        _LOGGER.debug(pprint.pformat(js_resp))
+        if js_resp["success"]:
+            self.current_vin = vin
+            _LOGGER.debug("Current vehicle: vin=%s", js_resp["data"]["vin"])
+            return js_resp["data"]
+        self.current_vin = None
+        return None
 
     async def _refresh_vehicles(self):
-        resp = await self.__open(
-            "/refreshVehicles.json", "get", params={"_": int(time.time())}
-        )
+        resp = await self.__open("/refreshVehicles.json", "get", params={"_": int(time.time())})
         js_resp = await resp.json()
         _LOGGER.debug(pprint.pformat(js_resp))
         vehicles = js_resp["data"]["vehicles"]
@@ -189,7 +180,7 @@ class Connection:
         result = []
         for vehicle in vehicles:
             vin = vehicle["vin"]
-            result.append(await self.select_vehicle(vin))
+            result.append(await self._select_vehicle(vin))
         return result
 
     async def _authorize_device(self):
@@ -201,14 +192,9 @@ class Connection:
                 "password": self.password,
                 "deviceId": self.device_id,
             }
-            resp = await self.__open(
-                "/login", "post", data=post_data, baseurl=web_baseurl
-            )
+            resp = await self.__open("/login", "post", data=post_data, baseurl=web_baseurl)
         resp = await self.__open(
-            "/profile/updateDeviceEntry.json",
-            "get",
-            params={"deviceId": self.device_id},
-            baseurl=web_baseurl,
+            "/profile/updateDeviceEntry.json", "get", params={"deviceId": self.device_id}, baseurl=web_baseurl,
         )
         if await resp.json():
             _LOGGER.debug("Device successfully authorized")
@@ -231,16 +217,7 @@ class Connection:
         _LOGGER.debug("Unknown Error during Set Device Name")
         return False
 
-    async def __open(
-        self,
-        url,
-        method="get",
-        headers=None,
-        data=None,
-        json=None,
-        params=None,
-        baseurl="",
-    ) -> None:
+    async def __open(self, url, method="get", headers=None, data=None, json=None, params=None, baseurl="",) -> None:
         """Open url."""
         if not baseurl:
             baseurl = self.baseurl
@@ -249,14 +226,14 @@ class Connection:
         _LOGGER.debug("%s: %s", method.upper(), url)
         with await self.lock:
             try:
-                resp = await getattr(self.websession, method)(
-                    url, headers=headers, params=params, data=data, json=json
-                )
+                resp = await getattr(self.websession, method)(url, headers=headers, params=params, data=data, json=json)
                 if resp.status > 299:
                     _LOGGER.debug(pprint.pformat(resp.request_info))
                     js_resp = await resp.json()
                     _LOGGER.debug(pprint.pformat(js_resp))
                     raise SubaruException(resp.status)
-            except aiohttp.ClientResponseError as exception_:
-                raise SubaruException(exception_.status)
+            except aiohttp.ClientResponseError as exception:
+                raise SubaruException(exception.status)
+            except aiohttp.ClientConnectionError:
+                raise SubaruException("aiohttp.ClientConnectionError")
             return resp
