@@ -11,7 +11,7 @@ from datetime import datetime
 import json
 import logging
 import os.path
-from pprint import pprint
+from pprint import pformat, pprint
 import shelve
 import shlex
 import sys
@@ -155,8 +155,8 @@ class CLI:  # pylint: disable=too-few-public-methods
         await self._session.close()
         sys.exit(code)
 
-    async def _vehicle_select(self, interactive=True, vin=None):
-        if self._config.get("default_vin") is None and interactive:
+    async def _vehicle_select(self, interactive=True, vin=None, reselect=False):
+        if (interactive and self._config.get("default_vin") is None) or reselect:
             while True:
                 selected = -1
                 print("\nAvailable Vehicles:")
@@ -234,16 +234,22 @@ class CLI:  # pylint: disable=too-few-public-methods
         if save == "Yes":
             self._save_config()
 
-    async def _start(self, args):
+    async def _remote_start(self, args):
         if len(args) == 0:
-            print("hvac <set|start|stop>")
+            print("\nremote_start [set|show|start|stop]")
+            print("  set   - enter climate settings")
+            print("  show  - show saved climate settings")
+            print("  start - start engine")
+            print("  stop  - stop engine\n")
         elif args[0] == "set":
             self._set_hvac_params()
+        elif args[0] == "show":
+            print(f"\n{pformat(self._config.get('hvac'))}\n")
         elif args[0] == "stop":
             await self._ctrl.remote_stop(self._current_vin)
         elif args[0] == "start":
             if self._config["hvac"] is None:
-                print("Specify settings with 'hvac set' first.")
+                print("Specify settings with 'remote_start set' first.")
             await self._ctrl.remote_start(
                 self._current_vin,
                 self._config["hvac"]["temp"],
@@ -256,11 +262,13 @@ class CLI:  # pylint: disable=too-few-public-methods
                 self._config["hvac"]["rear_ac"],
             )
         else:
-            print("hvac: invalid arg: %s" % args[0])
+            print("remote_start: invalid arg: %s" % args[0])
 
     def _show(self, args):
         if len(args) != 1:
-            print("show <summary|all>")
+            print("\nshow [summary|all]")
+            print("  summary - display summary information")
+            print("  all     - display all data available\n")
         elif args[0] == "all":
             pprint(self._car_data)
         elif args[0] == "summary":
@@ -270,9 +278,9 @@ class CLI:  # pylint: disable=too-few-public-methods
                 % (timediff.days, timediff.seconds // 3600, (timediff.seconds) // 60 % 60,)
             )
             if self._current_hasEV:
-                print("EV Charge: %s%%" % self._car_data["status"][sc.EV_STATE_OF_CHARGE_PERCENT], end="")
-                print("\tAux Battery: %sV" % self._car_data["status"][sc.BATTERY_VOLTAGE])
-                print("EV Plug Status: %s" % self._car_data["status"][sc.EV_IS_PLUGGED_IN], end="")
+                print("EV Charge: %s%%" % self._car_data["status"][sc.EV_STATE_OF_CHARGE_PERCENT])
+                print("Aux Battery: %sV" % self._car_data["status"][sc.BATTERY_VOLTAGE])
+                print("EV Plug Status: %s" % self._car_data["status"][sc.EV_IS_PLUGGED_IN])
                 print("EV Distance to Empty: %s miles" % self._car_data["status"][sc.EV_DISTANCE_TO_EMPTY])
             print("Odometer: %0.1f miles" % _meters_to_miles(self._car_data["status"][sc.ODOMETER]))
             print("External Temp: %0.1f °F" % _c_to_f(self._car_data["status"][sc.EXTERNAL_TEMP]))
@@ -324,23 +332,26 @@ class CLI:  # pylint: disable=too-few-public-methods
 
                 elif cmd in ["help", "?"]:
                     print("\nCommands:")
-                    print("  help    - display this help")
-                    print("  vehicle - change vehicle")
-                    print("  default - set this vehicle as default")
-                    print("  lock    - lock vehicle doors")
-                    print("  unlock  - unlock vehicle doors")
-                    print("  lights  - turn on lights")
-                    print("  horn    - sound horn")
+                    print("  help         - display this help")
+                    if len(self._cars) > 1:
+                        print("  vehicle      - change vehicle")
+                        print("  default      - set this vehicle as default")
+                    print("  lock         - lock vehicle doors")
+                    print("  unlock       - unlock vehicle doors")
+                    print("  lights       - turn on lights")
+                    print("  horn         - sound horn")
                     if self._current_api_gen == "g2":
-                        print("  show    - show vehicle information")
-                        print("  update  - request update from vehicle")
-                        print("  fetch   - fetch most recent update")
-                        print("  charge  - start EV charging")
-                        print("  start   - remote start")
+                        print("  show         - show vehicle information")
+                        print("  update       - request update from vehicle")
+                        print("  fetch        - fetch most recent update")
+                    if self._current_hasEV:
+                        print("  charge       - start EV charging")
+                    if self._current_hasRES or self._current_hasEV:
+                        print("  remote_start - remote start")
                     print("  quit\n")
 
                 elif cmd == "vehicle":
-                    await self._vehicle_select()
+                    await self._vehicle_select(reselect=True)
 
                 elif cmd == "default":
                     self._config["default_vin"] = self._current_vin
@@ -363,22 +374,22 @@ class CLI:  # pylint: disable=too-few-public-methods
 
                 elif cmd == "update" and self._current_api_gen == "g2":
                     await self._ctrl.update(self._current_vin)
-                    await self._ctrl._fetch
+                    await self._fetch()
 
                 elif cmd == "fetch" and self._current_api_gen == "g2":
-                    await self._ctrl._fetch
+                    await self._fetch()
 
-                elif cmd == "charge" and self._current_api_gen == "g2":
+                elif cmd == "charge" and self._current_hasEV:
                     await self._ctrl.charge_start(self._current_vin)
 
-                elif cmd == "start" and self._current_api_gen == "g2":
-                    await self._start(args)
+                elif cmd == "remote_start" and (self._current_hasRES or self._current_hasEV):
+                    await self._remote_start(args)
 
                 else:
                     print("invalid command: {}".format(cmd))
 
             except SubaruException as exc:
-                print(exc.message)
+                LOGGER.error("SubaruException caught: %s", exc.message)
 
     async def run(self):
         """Initialize connection and start CLI loop."""
@@ -411,52 +422,56 @@ class CLI:  # pylint: disable=too-few-public-methods
         )
 
         if await self._connect(interactive=False, vin=vin):
-            if cmd == "status":
-                success = await self._fetch()
-                pprint(self._car_data)
+            try:
+                if cmd == "status":
+                    success = await self._fetch()
+                    pprint(self._car_data)
 
-            elif cmd == "lock":
-                success = await self._ctrl.lock(self._current_vin)
+                elif cmd == "lock":
+                    success = await self._ctrl.lock(self._current_vin)
 
-            elif cmd == "unlock":
-                success = await self._ctrl.unlock(self._current_vin)
+                elif cmd == "unlock":
+                    success = await self._ctrl.unlock(self._current_vin)
 
-            elif cmd == "lights":
-                success = await self._ctrl.lights(self._current_vin)
+                elif cmd == "lights":
+                    success = await self._ctrl.lights(self._current_vin)
 
-            elif cmd == "horn":
-                success = await self._ctrl.horn(self._current_vin)
+                elif cmd == "horn":
+                    success = await self._ctrl.horn(self._current_vin)
 
-            elif cmd == "locate":
-                success = await self._ctrl.update(self._current_vin)
-                await self._fetch()
-                pprint(self._car_data.get("location"))
+                elif cmd == "locate":
+                    success = await self._ctrl.update(self._current_vin)
+                    await self._fetch()
+                    pprint(self._car_data.get("location"))
 
-            elif cmd == "remote_start":
-                if self._config.get("hvac") is None:
-                    LOGGER.error(
-                        "Remote start settings not found in config file.  Configure settings interactively first"
+                elif cmd == "remote_start":
+                    if self._config.get("hvac") is None:
+                        LOGGER.error(
+                            "Remote start settings not found in config file.  Configure settings interactively first"
+                        )
+                    success = await self._ctrl.remote_start(
+                        self._current_vin,
+                        self._config["hvac"]["temp"],
+                        self._config["hvac"]["mode"],
+                        self._config["hvac"]["left_seat"],
+                        self._config["hvac"]["right_seat"],
+                        self._config["hvac"]["rear_defrost"],
+                        self._config["hvac"]["speed"],
+                        self._config["hvac"]["recirculate"],
+                        self._config["hvac"]["rear_ac"],
                     )
-                success = await self._ctrl.remote_start(
-                    self._current_vin,
-                    self._config["hvac"]["temp"],
-                    self._config["hvac"]["mode"],
-                    self._config["hvac"]["left_seat"],
-                    self._config["hvac"]["right_seat"],
-                    self._config["hvac"]["rear_defrost"],
-                    self._config["hvac"]["speed"],
-                    self._config["hvac"]["recirculate"],
-                    self._config["hvac"]["rear_ac"],
-                )
 
-            elif cmd == "remote_stop":
-                success = await self._ctrl.remote_stop(self._current_vin)
+                elif cmd == "remote_stop":
+                    success = await self._ctrl.remote_stop(self._current_vin)
 
-            elif cmd == "charge":
-                success = await self._ctrl.charge_start(self._current_vin)
+                elif cmd == "charge":
+                    success = await self._ctrl.charge_start(self._current_vin)
 
-            else:
-                LOGGER.error("Unsupported command")
+                else:
+                    LOGGER.error("Unsupported command")
+
+            except SubaruException as exc:
+                LOGGER.error("SubaruException caught: %s", exc.message)
 
         if success:
             print(f"{OK}Command '{cmd}' completed for {self._current_vin}{ENDC}")
